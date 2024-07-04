@@ -1,0 +1,224 @@
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, CallbackContext
+from datetime import datetime
+import logging
+
+TOKEN = '6550343458:AAEPVUDi-nDrh1FTaxNc3mCYDNyuZI-kjq8'
+ADMIN_USER_ID = 647741237
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# Подключение к базе данных
+conn = sqlite3.connect('bot.db', check_same_thread=False)
+c = conn.cursor()
+
+def init_db():
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, request TEXT, chosen_time TEXT)
+    ''')
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY, time_slot TEXT)
+    ''')
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS statistics (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT, segment TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)
+    ''')
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY, text TEXT)
+    ''')
+    conn.commit()
+
+init_db()
+
+def user_exists(user_id):
+    c.execute('SELECT 1 FROM users WHERE id = ?', (user_id,))
+    return c.fetchone() is not None
+
+def add_user(user_id, username, request, chosen_time):
+    if user_exists(user_id):
+        c.execute('UPDATE users SET username = ?, request = ?, chosen_time = ? WHERE id = ?', (username, request, chosen_time, user_id))
+    else:
+        c.execute('INSERT INTO users (id, username, request, chosen_time) VALUES (?, ?, ?, ?)', (user_id, username, request, chosen_time))
+    conn.commit()
+
+def record_action(user_id, action, segment=''):
+    c.execute('INSERT INTO statistics (user_id, action, segment) VALUES (?, ?, ?)', (user_id, action, segment))
+    conn.commit()
+
+def get_questions():
+    c.execute('SELECT text FROM questions ORDER BY id')
+    return [row[0] for row in c.fetchall()]
+
+def update_question(question_id, new_text):
+    c.execute('UPDATE questions SET text = ? WHERE id = ?', (new_text, question_id))
+    conn.commit()
+
+def add_question(text):
+    c.execute('INSERT INTO questions (text) VALUES (?)', (text,))
+    conn.commit()
+
+def generate_recommendations(answers):
+    # Логика генерации рекомендаций на основе ответов
+    total_score = sum(answers)
+    if total_score <= 10:
+        return "Ваши ответы указывают на низкий уровень стресса. Рекомендуем продолжать придерживаться здорового образа жизни."
+    elif 11 <= total_score <= 20:
+        return "Ваши ответы указывают на средний уровень стресса. Рекомендуем заняться медитацией или йогой."
+    else:
+        return "Ваши ответы указывают на высокий уровень стресса. Рекомендуем обратиться к специалисту."
+
+async def start(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id if update.message else update.callback_query.from_user.id
+    record_action(user_id, 'start')
+    if update.message:
+        await update.message.reply_text("Привет! Ответьте на несколько вопросов, чтобы получить персонализированные рекомендации.")
+    context.user_data['answers'] = []
+    context.user_data['request'] = None
+    await ask_question(update, context, 0)
+
+async def ask_question(update: Update, context: CallbackContext, question_index: int) -> None:
+    questions = get_questions()
+    if question_index < len(questions):
+        keyboard = [[InlineKeyboardButton(str(i), callback_data=f"answer_{i}_{question_index}")] for i in range(1, 6)]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        if update.message:
+            await update.message.reply_text(questions[question_index], reply_markup=reply_markup)
+        elif update.callback_query:
+            await update.callback_query.message.reply_text(questions[question_index], reply_markup=reply_markup)
+
+async def button(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data.split('_')
+    answer = int(data[1])
+    question_index = int(data[2])
+    context.user_data['answers'].append(answer)
+    if question_index < len(get_questions()) - 1:
+        await ask_question(update, context, question_index + 1)
+    else:
+        request = ' '.join(map(str, context.user_data['answers']))
+        context.user_data['request'] = request
+        if query.message:
+            await query.message.reply_text("Спасибо за ваши ответы! Ваш запрос будет обработан.")
+        add_user(user_id, query.from_user.username, request, datetime.now().isoformat())
+        recommendations = generate_recommendations(context.user_data['answers'])
+        await query.message.reply_text(recommendations)
+        # Отправка видео рекомендаций
+        await query.message.reply_video(InputFile('uploaded_video.mp4'))
+        # Предложение записаться на консультацию
+        await query.message.reply_text("Хотите записаться на консультацию? Пожалуйста, введите ваш запрос.")
+
+async def handle_request(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    request_text = update.message.text
+    context.user_data['request'] = request_text
+    await update.message.reply_text("Спасибо за ваш запрос! Пожалуйста, выберите удобное время для консультации.")
+    await show_available_slots(update, context)
+
+def get_available_slots():
+    c.execute('SELECT id, time_slot FROM schedules')
+    return c.fetchall()
+
+async def show_available_slots(update: Update, context: CallbackContext) -> None:
+    slots = get_available_slots()
+    keyboard = [[InlineKeyboardButton(slot[1], callback_data=f"slot_{slot[0]}")] for slot in slots]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Выберите удобное время:", reply_markup=reply_markup)
+
+async def book_slot(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    slot_id = int(query.data.split('_')[1])
+    slot = get_slot_by_id(slot_id)
+    if slot:
+        add_user(user_id, query.from_user.username, context.user_data['request'], slot[1])
+        await query.message.reply_text(f"Консультация успешно забронирована на {slot[1]}.")
+        c.execute('DELETE FROM schedules WHERE id = ?', (slot_id,))
+        conn.commit()
+    else:
+        await query.message.reply_text("Извините, это время уже занято. Пожалуйста, выберите другое время.")
+        await show_available_slots(update, context)
+
+def get_slot_by_id(slot_id):
+    c.execute('SELECT id, time_slot FROM schedules WHERE id = ?', (slot_id,))
+    return c.fetchone()
+
+async def admin(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    if user_id == ADMIN_USER_ID:
+        record_action(user_id, 'admin')
+        keyboard = [
+            [InlineKeyboardButton("Просмотр статистики", callback_data="admin_stats")],
+            [InlineKeyboardButton("Редактировать вопросы", callback_data="admin_edit_questions")],
+            [InlineKeyboardButton("Корректировка дат и времени", callback_data="admin_edit_schedule")],
+            [InlineKeyboardButton("Загрузка видео", callback_data="admin_upload_video")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Добро пожаловать в панель администратора.", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text("У вас нет доступа к панели администратора.")
+
+async def admin_button(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    if user_id == ADMIN_USER_ID:
+        if query.data == "admin_stats":
+            c.execute('SELECT action, COUNT(*) FROM statistics GROUP BY action')
+            stats = c.fetchall()
+            stats_message = "\n".join([f"{action}: {count}" for action, count in stats])
+            await query.message.reply_text(f"Статистика:\n{stats_message}")
+        elif query.data == "admin_edit_questions":
+            questions = get_questions()
+            questions_message = "\n".join([f"{i+1}. {text}" for i, text in enumerate(questions)])
+            await query.message.reply_text(f"Текущие вопросы:\n{questions_message}\n\nОтправьте сообщение в формате /edit_question <номер> <новый текст> для редактирования вопроса.")
+        elif query.data == "admin_edit_schedule":
+            await query.message.reply_text("Функция корректировки дат и времени пока не реализована.")
+        elif query.data == "admin_upload_video":
+            await query.message.reply_text("Пожалуйста, загрузите видео файл.")
+    else:
+        await query.message.reply_text("У вас нет доступа к этой функции.")
+
+async def edit_question(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    if user_id == ADMIN_USER_ID:
+        try:
+            _, question_id, new_text = update.message.text.split(' ', 2)
+            question_id = int(question_id) - 1
+            update_question(question_id, new_text)
+            await update.message.reply_text(f"Вопрос номер {question_id + 1} обновлен.")
+        except ValueError:
+            await update.message.reply_text("Неверный формат команды. Используйте /edit_question <номер> <новый текст>")
+    else:
+        await update.message.reply_text("У вас нет доступа к этой функции.")
+
+async def upload_video(update: Update, context: CallbackContext) -> None:
+    user_id = update.message.from_user.id
+    if user_id == ADMIN_USER_ID and update.message.video:
+        video_file = update.message.video.get_file()
+        video_file.download('uploaded_video.mp4')
+        await update.message.reply_text("Видео успешно загружено.")
+    else:
+        await update.message.reply_text("У вас нет доступа к этой функции или неверный формат файла.")
+
+def main():
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(CommandHandler("edit_question", edit_question))
+    application.add_handler(MessageHandler(filters.VIDEO & filters.user(user_id=ADMIN_USER_ID), upload_video))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_request))
+    application.add_handler(CallbackQueryHandler(button, pattern='^answer_'))
+    application.add_handler(CallbackQueryHandler(admin_button, pattern='^admin_'))
+    application.add_handler(CallbackQueryHandler(book_slot, pattern='^slot_'))
+
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
